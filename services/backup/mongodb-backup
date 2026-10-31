@@ -221,10 +221,13 @@ restore_run() {
   [ -s "${WORK}/manifest" ] || die "run ${run} has no MANIFEST.txt (missing or incomplete); see 'mongodb-backup list'"
   manifest_oplog="$(sed -n 's/^oplog=//p' "${WORK}/manifest")"
   args=(--config="${WORK}/tools.yaml" --archive --gzip --drop --stopOnError)
-  [ "${manifest_oplog}" = true ] && args+=(--oplogReplay)
   if [ "${RESTORE_USERS}" != true ]; then
+    # mongorestore refuses --oplogReplay together with --nsExclude, so keeping the current users means
+    # the few writes captured while the dump ran are not replayed.
     args+=(--nsExclude=admin.system.users --nsExclude=admin.system.roles)
+    manifest_oplog=false
   fi
+  [ "${manifest_oplog}" = true ] && args+=(--oplogReplay)
   log "restoring run ${run} into ${SERVER_INFO% *} (drop + re-create the archived collections; oplog replay ${manifest_oplog:-false}; users and roles $([ "${RESTORE_USERS}" = true ] && echo restored || echo kept))"
   rclone cat "${dir}/${ARCHIVE}" | mongorestore "${args[@]}" || die "restore of run ${run} failed"
   printf 'restored_at=%s\ninto=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SERVER_INFO% *}" | rclone rcat "${dir}/RESTORED.txt"

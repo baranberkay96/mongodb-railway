@@ -68,10 +68,10 @@ datasource db {
 
 ```bash
 mongorestore --uri "{MONGO_PUBLIC_URL}" --gzip --archive=mongodb.archive.gz \
-  --oplogReplay --drop --nsExclude "admin.system.users" --nsExclude "admin.system.roles"
+  --drop --nsExclude "admin.system.users" --nsExclude "admin.system.roles"
 ```
 
-This drops and re-creates every collection in the archive and keeps the current users. To restore without local tools, set `BACKUP_RESTORE_RUN={run folder}` on MongoDB Backup and trigger the job. It restores that run once, writes `RESTORED.txt` next to it, then goes back to normal backups. Clear the variable afterwards.
+This drops and re-creates every collection in the archive and keeps the current users. (mongorestore can't combine `--oplogReplay` with `--nsExclude`, so writes made while the dump ran are not replayed.) To restore without local tools, set `BACKUP_RESTORE_RUN={run folder}` on MongoDB Backup and trigger the job. It restores that run once, writes `RESTORED.txt` next to it, then goes back to normal backups. Clear the variable afterwards.
 
 **Sizing and tuning.** The WiredTiger cache uses MongoDB's own formula, 50% of (RAM − 1 GB) with a minimum of 0.25 GB. The RAM figure is the container limit, capped at 8 GB, so a large plan limit does not reserve memory the data never uses. Override it with `MONGO_MEMORY_LIMIT_MB` or `MONGO_CACHE_SIZE_GB`. The oplog is 5% of the volume (128–2048 MB) when it is first created. A value of 990 or more in `MONGO_OPLOG_SIZE_MB` resizes an existing oplog. Each boot logs the values it chose.
 
