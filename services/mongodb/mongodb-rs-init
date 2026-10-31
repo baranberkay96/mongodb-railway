@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Background reconciler for the single-node replica set, started by mongodb-railway-start.
+#
+# Repeats rs-step.js until the member is PRIMARY: it initiates the replica set on the first boot
+# (idempotent: an initiated set is never initiated again), repairs the member host after a hostname change
+# or a REMOVED state, applies an explicit MONGO_OPLOG_SIZE_MB to an existing oplog, then exits.
+# It never stops mongod. While the root password is rejected it keeps retrying and says why.
+set -Euo pipefail
+
+STEP_JS="${MRS_STEP_JS:-/usr/local/lib/mongodb-railway/rs-step.js}"
+MONGOSH="${MRS_MONGOSH:-mongosh}"
+SLEEP="${MRS_SLEEP:-sleep}"
+AUTH_GRACE_SECONDS=180     # first boot: the root user does not exist until the entrypoint creates it
+QUIET_REPEAT_SECONDS=300   # an unchanged message is repeated at most this often
+MAX_DELAY_SECONDS=10       # normal polling; each check starts mongosh (about a second of CPU)
+AUTH_ERROR_DELAY_SECONDS=60
+
+log() { printf '[mongodb-rs-init] %s\n' "$*"; }
+
+# mongosh keeps logs and history under $HOME; keep them off the volume (HOME=/data/db in the image).
+HOME="$(mktemp -d "${TMPDIR:-/tmp}/mongosh-home.XXXXXX")"
+export HOME
+trap 'rm -rf "${HOME}"' EXIT
+
+started="$(date +%s)"
+delay=2
+last_message=""
+last_logged=0
+
+while :; do
+  rc=0
+  output="$("${MONGOSH}" --nodb --quiet --norc --file "${STEP_JS}" 2>&1)" || rc=$?
+  message="$(printf '%s' "${output}" | tail -n 1)"
+  now="$(date +%s)"
+  elapsed=$((now - started))
+
+  case "${rc}" in
+    0)
+      log "${message}"
+      exit 0
+      ;;
+    11)
+      log "${message}"
+      delay=2
+      ;;
+    20)
+      if [ "${elapsed}" -ge "${AUTH_GRACE_SECONDS}" ]; then
+        message="ERROR: mongod rejects MONGO_INITDB_ROOT_USERNAME/PASSWORD (${message}). These variables only create the user on the first boot; restore the old value, or change the password with db.changeUserPassword() first."
+      else
+        message="waiting for the root user (first boot creates it)"
+      fi
+      ;;
+    10 | 12)
+      if [ "${elapsed}" -lt "${QUIET_REPEAT_SECONDS}" ]; then
+        case "${message}" in
+          connect* | hello*) message="waiting for mongod on 127.0.0.1:27017" ;;
+        esac
+      fi
+      ;;
+    *)
+      message="rs-step.js exited ${rc}: ${message:-no output}"
+      ;;
+  esac
+
+  if [ "${rc}" != 11 ]; then
+    if [ "${message}" != "${last_message}" ] || [ $((now - last_logged)) -ge "${QUIET_REPEAT_SECONDS}" ]; then
+      log "${message}"
+      last_logged="${now}"
+    fi
+    delay=$((delay * 2))
+    [ "${delay}" -gt "${MAX_DELAY_SECONDS}" ] && delay="${MAX_DELAY_SECONDS}"
+    if [ "${rc}" = 20 ] && [ "${elapsed}" -ge "${AUTH_GRACE_SECONDS}" ]; then
+      delay="${AUTH_ERROR_DELAY_SECONDS}"
+    fi
+  fi
+  last_message="${message}"
+  "${SLEEP}" "${delay}"
+done

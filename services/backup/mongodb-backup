@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# Logical backups of the MongoDB replica set to a Railway Bucket (S3), with retention.
+# Runs once and exits: the "MongoDB Backup" service is a Railway cron job.
+#
+#   mongodb-backup backup         mongodump --archive --gzip --oplog -> Bucket, verify, prune (default)
+#   mongodb-backup list           list the backup runs stored in the Bucket
+#   mongodb-backup restore {run}  restore one complete run into MONGO_URL
+#
+# Layout in the Bucket (one folder per run, UTC timestamp):
+#   {BACKUP_PREFIX}/20261031T031500Z/mongodb.archive.gz   mongodump archive (gzip; oplog included)
+#   {BACKUP_PREFIX}/20261031T031500Z/MANIFEST.txt         written last; a run without it is incomplete
+#   {BACKUP_PREFIX}/20261031T031500Z/RESTORED.txt         written after a restore of that run
+#
+# Retention: complete runs older than BACKUP_RETENTION_DAYS are deleted, but the newest
+# BACKUP_KEEP_MIN complete runs are always kept. Incomplete runs older than two days are
+# deleted. A failed run deletes nothing.
+#
+# One-shot restore: set BACKUP_RESTORE_RUN={run} and trigger the job (railway cron run). The run is
+# restored once (RESTORED.txt marks it); later runs back up as usual and remind you to clear it.
+set -Eeuo pipefail
+
+PREFIX="${BACKUP_PREFIX:-mongodb}"
+RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
+KEEP_MIN="${BACKUP_KEEP_MIN:-3}"
+OPLOG="${BACKUP_OPLOG:-true}"
+VERIFY="${BACKUP_VERIFY:-full}"
+WAIT_SECONDS="${BACKUP_WAIT_SECONDS:-300}"
+ATTEMPTS="${BACKUP_ATTEMPTS:-2}"
+EXTRA_ARGS="${BACKUP_MONGODUMP_EXTRA_ARGS:-}"
+RESTORE_RUN="${BACKUP_RESTORE_RUN:-}"
+RESTORE_USERS="${BACKUP_RESTORE_USERS:-false}"
+PRIMARY_JS="${MBK_PRIMARY_JS:-/usr/local/lib/mongodb-backup/primary.js}"
+ARCHIVE="mongodb.archive.gz"
+INCOMPLETE_GRACE_DAYS=2
+RETRY_DELAY_SECONDS=30
+RUN_RE='^[0-9]{8}T[0-9]{6}Z$'
+REMOTE=""
+WORK=""
+
+log() { printf '[backup] %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+
+require_uint() {
+  local name="$1" value="$2" min="$3"
+  [[ "${value}" =~ ^[0-9]+$ ]] && [ "${value}" -ge "${min}" ] \
+    || die "${name} must be a whole number >= ${min} (got '${value}')"
+}
+
+require_bool() {
+  case "$2" in true | false) ;; *) die "$1 must be true or false (got '$2')" ;; esac
+}
+
+validate_settings() {
+  require_uint BACKUP_RETENTION_DAYS "${RETENTION_DAYS}" 1
+  require_uint BACKUP_KEEP_MIN "${KEEP_MIN}" 1
+  require_uint BACKUP_WAIT_SECONDS "${WAIT_SECONDS}" 0
+  require_uint BACKUP_ATTEMPTS "${ATTEMPTS}" 1
+  require_bool BACKUP_OPLOG "${OPLOG}"
+  require_bool BACKUP_RESTORE_USERS "${RESTORE_USERS}"
+  case "${VERIFY}" in full | quick) ;; *) die "BACKUP_VERIFY must be full or quick (got '${VERIFY}')" ;; esac
+  [[ "${PREFIX}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] && [[ "/${PREFIX}/" != */./* ]] && [[ "/${PREFIX}/" != */../* ]] \
+    || die "BACKUP_PREFIX must be a folder path of letters, digits, '.', '_' and '-' (no '.' or '..' segments)"
+  [ -z "${RESTORE_RUN}" ] || [[ "${RESTORE_RUN}" =~ ${RUN_RE} ]] \
+    || die "BACKUP_RESTORE_RUN must be a run folder name such as 20261031T031500Z (got '${RESTORE_RUN}')"
+  [[ "${MONGO_URL:-}" =~ ^mongodb(\+srv)?:// ]] || die "MONGO_URL must be a mongodb:// connection string"
+}
+
+# Temporary files (tool config with the connection string) live in a private directory.
+make_workdir() {
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/mongodb-backup.XXXXXX")"
+  chmod 0700 "${WORK}"
+  trap 'rm -rf "${WORK}"' EXIT
+  # Database Tools read the URI from a YAML file, so the password never appears in argv.
+  local escaped
+  escaped="$(printf '%s' "${MONGO_URL}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+  ( umask 077 && printf 'uri: "%s"\n' "${escaped}" > "${WORK}/tools.yaml" )
+}
+
+configure_remote() {
+  local var missing=()
+  for var in BACKUP_S3_BUCKET BACKUP_S3_ENDPOINT BACKUP_S3_ACCESS_KEY_ID BACKUP_S3_SECRET_ACCESS_KEY; do
+    [ -n "${!var:-}" ] || missing+=("${var}")
+  done
+  [ "${#missing[@]}" -eq 0 ] || die "Bucket not configured (missing: ${missing[*]})"
+  # rclone remote "bucket", configured only through the environment. Railway Buckets use
+  # virtual-hosted-style URLs (path style is rejected).
+  export RCLONE_CONFIG="${HOME:-/tmp}/rclone.conf"
+  : > "${RCLONE_CONFIG}"
+  export RCLONE_CONFIG_BUCKET_TYPE=s3
+  export RCLONE_CONFIG_BUCKET_PROVIDER=Other
+  export RCLONE_CONFIG_BUCKET_ENDPOINT="${BACKUP_S3_ENDPOINT}"
+  export RCLONE_CONFIG_BUCKET_REGION="${BACKUP_S3_REGION:-auto}"
+  export RCLONE_CONFIG_BUCKET_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY_ID}"
+  export RCLONE_CONFIG_BUCKET_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_ACCESS_KEY}"
+  export RCLONE_CONFIG_BUCKET_FORCE_PATH_STYLE="${BACKUP_S3_FORCE_PATH_STYLE:-false}"
+  export RCLONE_CONFIG_BUCKET_NO_CHECK_BUCKET=true
+  # 16 MiB parts: streams of unknown size up to ~150 GiB (10,000 parts).
+  export RCLONE_CONFIG_BUCKET_CHUNK_SIZE=16M
+  REMOTE="bucket:${BACKUP_S3_BUCKET}/${PREFIX}"
+}
+
+# Wait until the replica set has a writable primary (not just an open port). Sets SERVER_INFO.
+wait_for_primary() {
+  local waited=0 out
+  while :; do
+    if out="$(mongosh --nodb --quiet --norc --file "${PRIMARY_JS}" 2>&1)"; then
+      SERVER_INFO="$(printf '%s' "${out}" | tail -n 1)"
+      log "connected: replica set ${SERVER_INFO% *}, MongoDB ${SERVER_INFO##* }"
+      return 0
+    fi
+    [ "${waited}" -ge "${WAIT_SECONDS}" ] && die "MongoDB not ready after ${WAIT_SECONDS}s ($(printf '%s' "${out}" | tail -n 1))"
+    log "waiting for MongoDB: $(printf '%s' "${out}" | tail -n 1)"
+    sleep 10
+    waited=$((waited + 10))
+  done
+}
+
+dump_once() {
+  local dest="$1" args=(--config="${WORK}/tools.yaml" --archive --gzip) extra=()
+  [ "${OPLOG}" = true ] && args+=(--oplog)
+  [ -n "${EXTRA_ARGS}" ] && read -r -a extra <<< "${EXTRA_ARGS}"
+  # Stream straight to the Bucket; pipefail makes a failure of either side fail the upload.
+  mongodump "${args[@]}" ${extra[@]+"${extra[@]}"} | rclone rcat --retries 1 "${dest}"
+}
+
+verify_archive() {
+  local obj="$1" args=(--config="${WORK}/tools.yaml" --archive --gzip --dryRun)
+  [ "${OPLOG}" = true ] && args+=(--oplogReplay)
+  if [ "${VERIFY}" = full ]; then
+    # Reads the whole object back: a truncated or corrupt upload fails the gzip check.
+    rclone cat "${obj}" | gzip -t || return 1
+  fi
+  # mongorestore --dryRun reads the archive header and the namespace list (and checks that the
+  # oplog is present) without writing. Only its status counts: rclone may get SIGPIPE after that.
+  { rclone cat "${obj}" 2>/dev/null || true; } | mongorestore "${args[@]}" 2>&1 | tail -n 3
+}
+
+run_backup() {
+  local run_id dest attempt=1 size
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+  dest="${REMOTE}/${run_id}"
+  log "starting run ${run_id} -> ${PREFIX}/${run_id}/${ARCHIVE} in bucket ${BACKUP_S3_BUCKET} (oplog ${OPLOG})"
+  until dump_once "${dest}/${ARCHIVE}"; do
+    # mongodump --oplog fails when a renameCollection, \$out, mapReduce or user/role change runs
+    # during the dump; a second attempt usually succeeds.
+    [ "${attempt}" -ge "${ATTEMPTS}" ] && die "run ${run_id}: mongodump failed ${attempt} time(s); older backups were left untouched"
+    log "mongodump attempt ${attempt} failed; retrying in ${RETRY_DELAY_SECONDS}s"
+    attempt=$((attempt + 1))
+    sleep "${RETRY_DELAY_SECONDS}"
+  done
+  verify_archive "${dest}/${ARCHIVE}" || die "run ${run_id}: the uploaded archive failed verification (no MANIFEST.txt written)"
+  size="$(rclone size --json "${dest}/${ARCHIVE}" 2>/dev/null | sed -nE 's/.*"bytes":[[:space:]]*([0-9]+).*/\1/p')"
+  {
+    printf 'run=%s\narchive=%s\nbytes=%s\n' "${run_id}" "${ARCHIVE}" "${size:-0}"
+    printf 'replica_set=%s\nprimary=%s\nserver_version=%s\n' \
+      "$(printf '%s' "${SERVER_INFO}" | cut -d' ' -f1)" "$(printf '%s' "${SERVER_INFO}" | cut -d' ' -f2)" "${SERVER_INFO##* }"
+    printf 'mongodump=%s\noplog=%s\nverify=%s\n' "$(mongodump --version 2>/dev/null | head -n 1)" "${OPLOG}" "${VERIFY}"
+  } | rclone rcat "${dest}/MANIFEST.txt"
+  log "run ${run_id} complete: ${size:-?} bytes, verified (${VERIFY})"
+  CURRENT_RUN="${run_id}"
+}
+
+list_runs() {
+  # Folder names of every run, oldest first (non-matching folders are ignored).
+  rclone lsf --dirs-only "${REMOTE}/" 2>/dev/null | sed 's#/$##' | grep -E "${RUN_RE}" | sort || true
+}
+
+list_complete_runs() {
+  rclone lsf -R --files-only --max-depth 2 --include 'MANIFEST.txt' "${REMOTE}/" 2>/dev/null \
+    | sed 's#/MANIFEST.txt$##' | grep -E "${RUN_RE}" | sort || true
+}
+
+prune() {
+  local now cutoff incomplete_cutoff complete=() run keep protected=" " total
+  now="$(date -u +%s)"
+  cutoff="$(date -u -d "@$((now - RETENTION_DAYS * 86400))" +%Y%m%dT%H%M%SZ)"
+  incomplete_cutoff="$(date -u -d "@$((now - INCOMPLETE_GRACE_DAYS * 86400))" +%Y%m%dT%H%M%SZ)"
+  while IFS= read -r run; do [ -n "${run}" ] && complete+=("${run}"); done < <(list_complete_runs)
+  total="${#complete[@]}"
+  keep=$((total - KEEP_MIN))
+  for run in ${complete[@]+"${complete[@]}"}; do
+    # The newest KEEP_MIN complete runs are protected regardless of age.
+    if [ "${keep}" -le 0 ]; then protected="${protected}${run} "; fi
+    keep=$((keep - 1))
+  done
+  log "retention: ${total} complete run(s), keep ${RETENTION_DAYS} days (older than ${cutoff}), at least ${KEEP_MIN}"
+  while IFS= read -r run; do
+    [ -n "${run}" ] || continue
+    [ "${run}" = "${CURRENT_RUN:-}" ] && continue
+    [ "${run}" = "${RESTORE_RUN}" ] && continue
+    case "${protected}" in *" ${run} "*) continue ;; esac
+    if printf '%s\n' ${complete[@]+"${complete[@]}"} | grep -qx "${run}"; then
+      [[ "${run}" < "${cutoff}" ]] || continue
+      log "deleting expired run ${run}"
+    else
+      [[ "${run}" < "${incomplete_cutoff}" ]] || continue
+      log "deleting incomplete run ${run}"
+    fi
+    rclone purge "${REMOTE}/${run}" || log "WARNING: could not delete ${run}"
+  done < <(list_runs)
+}
+
+show_runs() {
+  local complete=" " run
+  while IFS= read -r run; do complete="${complete}${run} "; done < <(list_complete_runs)
+  while IFS= read -r run; do
+    [ -n "${run}" ] || continue
+    case "${complete}" in *" ${run} "*) printf '%s complete\n' "${run}" ;; *) printf '%s incomplete\n' "${run}" ;; esac
+  done < <(list_runs)
+}
+
+# Restore one complete run into MONGO_URL: collections in the archive are dropped and re-created,
+# collections that are not in the archive are left alone. Users and roles are kept as they are
+# unless BACKUP_RESTORE_USERS=true (the archive's root user would replace the current password).
+restore_run() {
+  local run="$1" dir manifest_oplog args
+  [[ "${run}" =~ ${RUN_RE} ]] || die "restore needs a run folder name such as 20261031T031500Z (got '${run}')"
+  dir="${REMOTE}/${run}"
+  rclone cat "${dir}/MANIFEST.txt" > "${WORK}/manifest" 2>/dev/null \
+    || die "run ${run} has no MANIFEST.txt (missing or incomplete); see 'mongodb-backup list'"
+  manifest_oplog="$(sed -n 's/^oplog=//p' "${WORK}/manifest")"
+  args=(--config="${WORK}/tools.yaml" --archive --gzip --drop --stopOnError)
+  [ "${manifest_oplog}" = true ] && args+=(--oplogReplay)
+  if [ "${RESTORE_USERS}" != true ]; then
+    args+=(--nsExclude=admin.system.users --nsExclude=admin.system.roles)
+  fi
+  log "restoring run ${run} into ${SERVER_INFO% *} (drop + re-create the archived collections; oplog replay ${manifest_oplog:-false}; users and roles $([ "${RESTORE_USERS}" = true ] && echo restored || echo kept))"
+  rclone cat "${dir}/${ARCHIVE}" | mongorestore "${args[@]}" || die "restore of run ${run} failed"
+  printf 'restored_at=%s\ninto=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SERVER_INFO% *}" | rclone rcat "${dir}/RESTORED.txt"
+  log "restore of run ${run} complete"
+}
+
+# BACKUP_RESTORE_RUN: restore once, then behave like a normal backup job.
+maybe_restore() {
+  [ -n "${RESTORE_RUN}" ] || return 0
+  if rclone cat "${REMOTE}/${RESTORE_RUN}/RESTORED.txt" > /dev/null 2>&1; then
+    log "WARNING: run ${RESTORE_RUN} was already restored; clear BACKUP_RESTORE_RUN. Taking a normal backup."
+    return 0
+  fi
+  restore_run "${RESTORE_RUN}"
+  log "clear BACKUP_RESTORE_RUN on this service; the next scheduled run takes a normal backup"
+  exit 0
+}
+
+main() {
+  local cmd="${1:-backup}"
+  case "${cmd}" in
+    backup)
+      validate_settings
+      make_workdir
+      configure_remote
+      wait_for_primary
+      maybe_restore
+      run_backup
+      prune
+      log "done"
+      ;;
+    list)
+      configure_remote
+      show_runs
+      ;;
+    restore)
+      [ "$#" -eq 2 ] || die "usage: mongodb-backup restore {run}"
+      validate_settings
+      make_workdir
+      configure_remote
+      wait_for_primary
+      restore_run "$2"
+      ;;
+    *)
+      die "unknown command '${cmd}' (use: backup, list, restore {run})"
+      ;;
+  esac
+}
+
+main "$@"

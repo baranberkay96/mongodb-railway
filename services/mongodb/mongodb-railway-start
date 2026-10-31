@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# MongoDB 8.0 single-node replica set for Railway: start-up wrapper (the image ENTRYPOINT).
+#
+# Runs as root before the official docker-entrypoint.sh, then hands over to it:
+#   1. validates the variables (a bad value stops the service with exit 78 and the variable's name);
+#   2. writes the replica-set keyFile from MONGO_REPLICA_SET_KEY (mode 0400, owner mongodb);
+#   3. maps the member host to 127.0.0.1 in /etc/hosts, so mongod finds itself in the replica-set
+#      config even before Railway's private DNS knows this deployment;
+#   4. sizes the WiredTiger cache from the container memory limit and the oplog for the first boot;
+#   5. on Linux 6.19.0-7.0.13 turns off TCMalloc's per-CPU caches, which mongod 8.0.34 refuses to
+#      start with on those kernels (SERVER-121912);
+#   6. takes a lock on the volume, so an overlapping deployment never opens the same data files;
+#   7. starts mongodb-rs-init in the background (initiate once, repair the member host, resize the oplog);
+#   8. execs docker-entrypoint.sh: root user on the first boot, then mongod --replSet --keyFile --auth.
+set -Eeuo pipefail
+
+# Paths are overridable only so the test harness can run this script outside the image.
+DATA_DIR="${MRS_DATA_DIR:-/data/db}"
+KEY_DIR="${MRS_KEY_DIR:-/etc/mongodb-railway}"
+HOSTS_FILE="${MRS_HOSTS_FILE:-/etc/hosts}"
+CGROUP_DIR="${MRS_CGROUP_DIR:-/sys/fs/cgroup}"
+MEMINFO="${MRS_MEMINFO:-/proc/meminfo}"
+ENTRYPOINT="${MRS_ENTRYPOINT:-/usr/local/bin/docker-entrypoint.sh}"
+RS_INIT="${MRS_RS_INIT:-/usr/local/bin/mongodb-rs-init}"
+
+MONGOD_PORT=27017
+MEMORY_AUTO_CAP_MB=8192
+OPLOG_AUTO_MIN_MB=128
+OPLOG_AUTO_MAX_MB=2048
+LOCK_WAIT_SECONDS=600
+EX_CONFIG=78
+
+log() { printf '[mongodb-railway] %s\n' "$*"; }
+fail() { log "ERROR: $*" >&2; exit "${EX_CONFIG}"; }
+
+is_uint() { case "$1" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# clamp VALUE MIN MAX
+clamp() {
+  local v="$1"
+  [ "${v}" -lt "$2" ] && v="$2"
+  [ "${v}" -gt "$3" ] && v="$3"
+  printf '%s\n' "${v}"
+}
+
+# A setting is "auto" or a whole number in [min, max].
+uint_or_auto() {
+  local name="$1" value="$2" min="$3" max="$4"
+  [ "${value}" = auto ] && return 0
+  is_uint "${value}" && [ "${value}" -ge "${min}" ] && [ "${value}" -le "${max}" ] \
+    || fail "${name} must be auto or a whole number from ${min} to ${max} (got '${value}')"
+}
+
+validate() {
+  : "${MONGO_INITDB_ROOT_USERNAME:=}" "${MONGO_INITDB_ROOT_PASSWORD:=}" "${MONGO_REPLICA_SET_KEY:=}"
+  RS_NAME="${MONGO_REPLICA_SET_NAME:-rs0}"
+  MEMBER_HOST="${MONGO_REPLICA_SET_HOST:-}"
+  if [ -z "${MEMBER_HOST}" ] && [ -n "${RAILWAY_PRIVATE_DOMAIN:-}" ]; then
+    MEMBER_HOST="${RAILWAY_PRIVATE_DOMAIN}:${MONGOD_PORT}"
+  fi
+  CACHE_GB="${MONGO_CACHE_SIZE_GB:-auto}"
+  MEMORY_MB="${MONGO_MEMORY_LIMIT_MB:-auto}"
+  OPLOG_MB="${MONGO_OPLOG_SIZE_MB:-auto}"
+  SELF_RESOLVE="${MONGO_SELF_RESOLVE:-hosts}"
+  RSEQ="${MONGO_RSEQ_WORKAROUND:-auto}"
+  FTDC="${MONGO_FTDC_ENABLED:-false}"
+
+  [ -n "${MONGO_INITDB_ROOT_USERNAME}" ] || fail "MONGO_INITDB_ROOT_USERNAME is empty"
+  [ -n "${MONGO_INITDB_ROOT_PASSWORD}" ] || fail "MONGO_INITDB_ROOT_PASSWORD is empty"
+  [ "${#MONGO_INITDB_ROOT_PASSWORD}" -ge 12 ] || fail "MONGO_INITDB_ROOT_PASSWORD must have at least 12 characters"
+  [[ "${RS_NAME}" =~ ^[A-Za-z0-9_-]{1,64}$ ]] \
+    || fail "MONGO_REPLICA_SET_NAME must be 1-64 letters, digits, '_' or '-' (got '${RS_NAME}')"
+  # keyFile rules (MongoDB docs): 6-1024 characters of the base64 set.
+  [[ "${MONGO_REPLICA_SET_KEY}" =~ ^[A-Za-z0-9+/=]+$ ]] && [ "${#MONGO_REPLICA_SET_KEY}" -ge 6 ] \
+    && [ "${#MONGO_REPLICA_SET_KEY}" -le 1024 ] \
+    || fail "MONGO_REPLICA_SET_KEY must be 6-1024 characters of A-Z a-z 0-9 + / ="
+  [ -n "${MEMBER_HOST}" ] \
+    || fail "MONGO_REPLICA_SET_HOST is empty and RAILWAY_PRIVATE_DOMAIN is not set (enable private networking)"
+  [[ "${MEMBER_HOST}" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*:${MONGOD_PORT}$ ]] && [ "${#MEMBER_HOST}" -le 259 ] \
+    || fail "MONGO_REPLICA_SET_HOST must be {hostname}:${MONGOD_PORT} (got '${MEMBER_HOST}')"
+  if [ "${CACHE_GB}" != auto ]; then
+    [[ "${CACHE_GB}" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] \
+      && awk -v v="${CACHE_GB}" 'BEGIN { exit !(v >= 0.25 && v <= 1024) }' \
+      || fail "MONGO_CACHE_SIZE_GB must be auto or a number from 0.25 to 1024 (got '${CACHE_GB}')"
+  fi
+  uint_or_auto MONGO_MEMORY_LIMIT_MB "${MEMORY_MB}" 256 4194304
+  uint_or_auto MONGO_OPLOG_SIZE_MB "${OPLOG_MB}" 1 1048576
+  case "${SELF_RESOLVE}" in hosts | dns) ;; *) fail "MONGO_SELF_RESOLVE must be hosts or dns (got '${SELF_RESOLVE}')" ;; esac
+  case "${RSEQ}" in auto | on | off) ;; *) fail "MONGO_RSEQ_WORKAROUND must be auto, on or off (got '${RSEQ}')" ;; esac
+  case "${FTDC}" in true | false) ;; *) fail "MONGO_FTDC_ENABLED must be true or false (got '${FTDC}')" ;; esac
+
+  # The connection-string variables are composed by Railway without URL encoding.
+  if [[ ! "${MONGO_INITDB_ROOT_USERNAME}${MONGO_INITDB_ROOT_PASSWORD}" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+    log "WARNING: the root user name or password contains characters that must be percent-encoded in a URL;" \
+      "MONGO_URL, MONGO_PUBLIC_URL and DATABASE_URL will not parse until you encode them"
+  fi
+}
+
+# Memory the cache is planned for, in MB: MONGO_MEMORY_LIMIT_MB, else the cgroup limit (v2 or v1)
+# bounded by MemTotal and capped at MEMORY_AUTO_CAP_MB. Sets BUDGET_MB, BUDGET_SOURCE.
+memory_budget() {
+  local total_kb limit_raw limit_mb total_mb
+  total_kb="$(awk '/^MemTotal:/ { print $2; exit }' "${MEMINFO}" 2>/dev/null || true)"
+  is_uint "${total_kb}" && total_mb=$((total_kb / 1024)) || total_mb=2048
+  limit_raw="$(cat "${CGROUP_DIR}/memory.max" 2>/dev/null || cat "${CGROUP_DIR}/memory/memory.limit_in_bytes" 2>/dev/null || true)"
+  if is_uint "${limit_raw}" && [ "${#limit_raw}" -le 15 ]; then
+    limit_mb=$((limit_raw / 1048576))
+    [ "${limit_mb}" -gt "${total_mb}" ] && limit_mb="${total_mb}"
+    BUDGET_SOURCE="container limit ${limit_mb}MB"
+  else
+    limit_mb="${total_mb}"
+    BUDGET_SOURCE="no container limit, host ${total_mb}MB"
+  fi
+  if [ "${MEMORY_MB}" != auto ]; then
+    BUDGET_MB="${MEMORY_MB}"
+    BUDGET_SOURCE="MONGO_MEMORY_LIMIT_MB"
+  else
+    BUDGET_MB="$(clamp "${limit_mb}" 256 "${MEMORY_AUTO_CAP_MB}")"
+  fi
+}
+
+# WiredTiger cache: MongoDB's own default formula (50% of RAM minus 1 GB, at least 256 MB),
+# applied to the budget instead of the host's RAM. Sets CACHE_GB_EFFECTIVE.
+cache_size() {
+  if [ "${CACHE_GB}" != auto ]; then
+    CACHE_GB_EFFECTIVE="${CACHE_GB}"
+    return
+  fi
+  local cache_mb=$(((BUDGET_MB - 1024) / 2))
+  [ "${cache_mb}" -lt 256 ] && cache_mb=256
+  CACHE_GB_EFFECTIVE="$(awk -v mb="${cache_mb}" 'BEGIN { printf "%.2f", mb / 1024 }')"
+}
+
+# Oplog size used when the replica set is first initiated: 5% of the volume, 128-2048 MB.
+# Later boots keep the stored size; an explicit MONGO_OPLOG_SIZE_MB >= 990 is applied to an existing
+# oplog by mongodb-rs-init (replSetResizeOplog). Sets OPLOG_MB_EFFECTIVE.
+oplog_size() {
+  if [ "${OPLOG_MB}" != auto ]; then
+    OPLOG_MB_EFFECTIVE="${OPLOG_MB}"
+    return
+  fi
+  local size_kb
+  size_kb="$(df -Pk "${DATA_DIR}" 2>/dev/null | awk 'NR == 2 { print $2 }' || true)"
+  if is_uint "${size_kb}" && [ "${size_kb}" -gt 0 ]; then
+    OPLOG_MB_EFFECTIVE="$(clamp $((size_kb / 1024 / 20)) "${OPLOG_AUTO_MIN_MB}" "${OPLOG_AUTO_MAX_MB}")"
+  else
+    OPLOG_MB_EFFECTIVE=1024
+  fi
+}
+
+# mongod 8.0.34 exits on Linux 6.19.0-7.0.13 while TCMalloc's per-CPU caches are active
+# (SERVER-121912). glibc.pthread.rseq=1 lets glibc keep rseq, which turns those caches off.
+rseq_workaround() {
+  local release major minor patch rest affected=false
+  release="$(uname -r 2>/dev/null || true)"
+  if [[ "${release}" =~ ^([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    patch="${BASH_REMATCH[4]:-0}"
+    local v=$((major * 1000000 + minor * 1000 + patch))
+    if [ "${v}" -ge 6019000 ] && [ "${v}" -le 7000013 ]; then affected=true; fi
+  fi
+  RSEQ_STATE="off (kernel ${release:-unknown})"
+  if [ "${RSEQ}" = on ] || { [ "${RSEQ}" = auto ] && [ "${affected}" = true ]; }; then
+    rest="$(printf '%s' "${GLIBC_TUNABLES:-}" | tr ':' '\n' | grep -v '^glibc\.pthread\.rseq=' | grep -v '^$' | paste -sd ':' - || true)"
+    export GLIBC_TUNABLES="${rest:+${rest}:}glibc.pthread.rseq=1"
+    RSEQ_STATE="on (kernel ${release:-unknown}; TCMalloc per-CPU caches off)"
+  fi
+}
+
+write_keyfile() {
+  local tmp="${KEY_DIR}/keyfile.tmp.$$"
+  KEYFILE="${KEY_DIR}/keyfile"
+  mkdir -p "${KEY_DIR}"
+  ( umask 077 && printf '%s\n' "${MONGO_REPLICA_SET_KEY}" > "${tmp}" )
+  if [ "$(id -u)" = 0 ]; then
+    chown mongodb:mongodb "${KEY_DIR}" "${tmp}"
+    chmod 0700 "${KEY_DIR}"
+  fi
+  chmod 0400 "${tmp}"
+  mv -f "${tmp}" "${KEYFILE}"
+}
+
+# Railway registers a deployment's private DNS name only after it is up, so mongod would not
+# recognise itself in the replica-set config at boot (it would stay REMOVED). A hosts entry for
+# the member host makes the self-check pass at once; other services still use Railway's DNS.
+map_self_host() {
+  local name="${MEMBER_HOST%:*}"
+  SELF_STATE="dns (waits for Railway's private DNS)"
+  [ "${SELF_RESOLVE}" = hosts ] || return 0
+  if awk -v h="${name}" '$1 == "127.0.0.1" { for (i = 2; i <= NF; i++) if ($i == h) found = 1 } END { exit !found }' \
+    "${HOSTS_FILE}" 2>/dev/null; then
+    SELF_STATE="hosts (already mapped)"
+  elif printf '127.0.0.1\t%s\n' "${name}" >> "${HOSTS_FILE}" 2>/dev/null; then
+    SELF_STATE="hosts (${name} -> 127.0.0.1 in this container)"
+  else
+    SELF_STATE="dns (${HOSTS_FILE} is read-only; mongodb-rs-init repairs the member once DNS resolves)"
+  fi
+}
+
+# Hold an exclusive lock on the volume for mongod's lifetime (fd 9 is inherited through exec).
+# If the previous deployment still runs, wait for it; after LOCK_WAIT_SECONDS mongod's own
+# lock file decides.
+lock_volume() {
+  command -v flock > /dev/null 2>&1 || { log "flock not available; skipping the volume lock"; return 0; }
+  exec 9> "${DATA_DIR}/.railway-mongodb.lock" || { log "cannot create the volume lock file; skipping"; return 0; }
+  local waited=0
+  until flock -n 9; do
+    if [ "${waited}" -ge "${LOCK_WAIT_SECONDS}" ]; then
+      log "WARNING: volume lock still held after ${LOCK_WAIT_SECONDS}s; starting anyway (mongod's own lock protects the files)"
+      return 0
+    fi
+    [ $((waited % 30)) -eq 0 ] && log "waiting for the previous deployment to release the volume (${waited}s)"
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+main() {
+  # Commands other than mongod (for example a shell) run unchanged.
+  if [ "$#" -gt 0 ] && [ "$1" != mongod ]; then
+    exec "$@"
+  fi
+  [ "$#" -gt 0 ] && shift
+
+  validate
+  memory_budget
+  cache_size
+  oplog_size
+  rseq_workaround
+  mkdir -p "${DATA_DIR}"
+  write_keyfile
+  map_self_host
+  lock_volume
+
+  local extra=()
+  [ -n "${MONGOD_EXTRA_ARGS:-}" ] && read -r -a extra <<< "${MONGOD_EXTRA_ARGS}"
+
+  log "replica set ${RS_NAME}, member ${MEMBER_HOST}, self-resolution ${SELF_STATE}"
+  log "WiredTiger cache ${CACHE_GB_EFFECTIVE} GB (budget ${BUDGET_MB} MB, ${BUDGET_SOURCE}); oplog ${OPLOG_MB_EFFECTIVE} MB on first initiate; rseq workaround ${RSEQ_STATE}"
+
+  export MONGO_REPLICA_SET_NAME="${RS_NAME}" MONGO_REPLICA_SET_HOST="${MEMBER_HOST}" MONGO_SELF_RESOLVE="${SELF_RESOLVE}"
+  # Reconciler: double fork so PID 1 reaps it; it must not inherit the volume lock.
+  ( "${RS_INIT}" 9>&- < /dev/null & )
+
+  # mongod never needs these; keep them out of its environment. The official entrypoint reads
+  # MONGO_INITDB_ROOT_* on the first boot and unsets them itself.
+  unset MONGO_REPLICA_SET_KEY MONGOPASSWORD MONGO_URL MONGO_PUBLIC_URL DATABASE_URL DATABASE_PUBLIC_URL
+
+  exec "${ENTRYPOINT}" mongod \
+    --port "${MONGOD_PORT}" \
+    --ipv6 --bind_ip "::,0.0.0.0" \
+    --replSet "${RS_NAME}" \
+    --keyFile "${KEYFILE}" \
+    --wiredTigerCacheSizeGB "${CACHE_GB_EFFECTIVE}" \
+    --oplogSize "${OPLOG_MB_EFFECTIVE}" \
+    --setParameter "diagnosticDataCollectionEnabled=${FTDC}" \
+    ${extra[@]+"${extra[@]}"} "$@"
+}
+
+main "$@"

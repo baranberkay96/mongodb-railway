@@ -1,0 +1,267 @@
+{
+  "name": "MongoDB 8 Replica Set (Prisma-Ready) with Backups",
+  "description": "Single-node replica set for transactions and change streams, with backups.",
+  "category": "Storage",
+  "tags": [
+    "mongodb",
+    "mongo",
+    "replica-set",
+    "prisma",
+    "transactions",
+    "change-streams",
+    "nosql",
+    "backups"
+  ],
+  "image": "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/mongodb.svg",
+  "upstream": {
+    "mongodb": "mongo:8.0.34-noble@sha256:3c64937121b9437095921c4bb2569911084c05f7b88e4a263d62a8959d2b2399 (MongoDB Community Server 8.0.34, Docker Official Image built 2026-10-26)",
+    "rclone": "rclone/rclone:1.75.2@sha256:2687085f718d3c628f7fdfb77c52a1d344332aed543110bb88088f2c70d43eb5 (rclone 1.75.2, 2026-10-09)",
+    "entrypoint": "docker-library/mongo 8.0/docker-entrypoint.sh (identical to the file in the pinned image)",
+    "license": "MongoDB Community Server: SSPL-1.0; Database Tools and mongosh: Apache-2.0; rclone: MIT",
+    "checked": "2026-10-31"
+  },
+  "services": {
+    "MongoDB": {
+      "icon": "https://devicons.railway.app/i/mongodb.svg",
+      "source": {
+        "repo": "baranberkay96/mongodb-railway",
+        "rootDirectory": "/services/mongodb"
+      },
+      "startCommand": null,
+      "preDeployCommand": null,
+      "healthcheckPath": null,
+      "healthcheckTimeout": null,
+      "restartPolicyType": "ALWAYS",
+      "numReplicas": 1,
+      "cronSchedule": null,
+      "publicDomain": false,
+      "targetPort": null,
+      "tcpProxy": {
+        "port": 27017
+      },
+      "volume": {
+        "mountPath": "/data/db"
+      },
+      "variables": {
+        "MONGOHOST": {
+          "defaultValue": "${{RAILWAY_PRIVATE_DOMAIN}}",
+          "description": "Private hostname of this database (mongodb.railway.internal), same as Railway's MongoDB.",
+          "required": true
+        },
+        "MONGOPORT": {
+          "defaultValue": "27017",
+          "description": "MongoDB port (fixed: mongod always listens on 27017).",
+          "required": true
+        },
+        "MONGOUSER": {
+          "defaultValue": "${{MONGO_INITDB_ROOT_USERNAME}}",
+          "description": "Root user name for clients and the Data panel.",
+          "required": true
+        },
+        "MONGOPASSWORD": {
+          "defaultValue": "${{MONGO_INITDB_ROOT_PASSWORD}}",
+          "description": "Root password for clients and the Data panel.",
+          "required": true
+        },
+        "MONGO_INITDB_ROOT_USERNAME": {
+          "defaultValue": "mongo",
+          "description": "Root user created on the first boot (role root on admin). Changing it later does not rename the user.",
+          "required": true
+        },
+        "MONGO_INITDB_ROOT_PASSWORD": {
+          "defaultValue": "${{ secret(32, \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\") }}",
+          "description": "Root password, generated at deploy (letters only, URL-safe). Set on the first boot only: change it with db.changeUserPassword() first, then here.",
+          "required": true
+        },
+        "MONGO_REPLICA_SET_NAME": {
+          "defaultValue": "rs0",
+          "description": "Replica set name (replicaSet= in connection strings). Fixed after the first boot.",
+          "required": true
+        },
+        "MONGO_REPLICA_SET_KEY": {
+          "defaultValue": "${{ secret(64, \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\") }}",
+          "description": "keyFile content for internal replica-set authentication, written to a 0400 file at every boot. Not a client password.",
+          "required": true
+        },
+        "MONGO_REPLICA_SET_HOST": {
+          "defaultValue": "${{RAILWAY_PRIVATE_DOMAIN}}:27017",
+          "description": "Member host stored in the replica-set config; drivers connect to it. Kept in sync at boot if the private hostname changes.",
+          "required": true
+        },
+        "MONGO_DATABASE": {
+          "defaultValue": "railway",
+          "description": "Application database used in DATABASE_URL (MongoDB creates it on the first write).",
+          "required": false
+        },
+        "MONGO_URL": {
+          "defaultValue": "mongodb://${{MONGO_INITDB_ROOT_USERNAME}}:${{MONGO_INITDB_ROOT_PASSWORD}}@${{RAILWAY_PRIVATE_DOMAIN}}:27017/?replicaSet=${{MONGO_REPLICA_SET_NAME}}&authSource=admin",
+          "description": "Private connection string (replica set, private network only). Other services reference it as MongoDB.MONGO_URL.",
+          "required": true
+        },
+        "MONGO_PUBLIC_URL": {
+          "defaultValue": "mongodb://${{MONGO_INITDB_ROOT_USERNAME}}:${{MONGO_INITDB_ROOT_PASSWORD}}@${{RAILWAY_TCP_PROXY_DOMAIN}}:${{RAILWAY_TCP_PROXY_PORT}}/?directConnection=true&authSource=admin",
+          "description": "Connection from outside Railway through the TCP proxy (directConnection=true; no TLS; egress is billed).",
+          "required": true
+        },
+        "DATABASE_URL": {
+          "defaultValue": "mongodb://${{MONGO_INITDB_ROOT_USERNAME}}:${{MONGO_INITDB_ROOT_PASSWORD}}@${{RAILWAY_PRIVATE_DOMAIN}}:27017/${{MONGO_DATABASE}}?replicaSet=${{MONGO_REPLICA_SET_NAME}}&authSource=admin",
+          "description": "Prisma-style URL with the database name (private network). Set your app's DATABASE_URL to a reference of it.",
+          "required": false
+        },
+        "DATABASE_PUBLIC_URL": {
+          "defaultValue": "mongodb://${{MONGO_INITDB_ROOT_USERNAME}}:${{MONGO_INITDB_ROOT_PASSWORD}}@${{RAILWAY_TCP_PROXY_DOMAIN}}:${{RAILWAY_TCP_PROXY_PORT}}/${{MONGO_DATABASE}}?directConnection=true&authSource=admin",
+          "description": "Prisma-style URL through the TCP proxy, e.g. for prisma db push from your machine.",
+          "required": false
+        },
+        "MONGO_MEMORY_LIMIT_MB": {
+          "defaultValue": "auto",
+          "description": "RAM the cache is planned for. auto = the container limit capped at 8192 MB; or a number of MB.",
+          "required": false
+        },
+        "MONGO_CACHE_SIZE_GB": {
+          "defaultValue": "auto",
+          "description": "WiredTiger cache. auto = 50% of (memory budget - 1 GB), at least 0.25; or a number of GB (0.25-1024).",
+          "required": false
+        },
+        "MONGO_OPLOG_SIZE_MB": {
+          "defaultValue": "auto",
+          "description": "Oplog size. auto = 5% of the volume (128-2048 MB) when first created; a number >= 990 also resizes an existing oplog.",
+          "required": false
+        },
+        "MONGO_SELF_RESOLVE": {
+          "defaultValue": "hosts",
+          "description": "hosts = map the member host to 127.0.0.1 inside this container so mongod finds itself at boot; dns = wait for Railway DNS.",
+          "required": false
+        },
+        "MONGO_RSEQ_WORKAROUND": {
+          "defaultValue": "auto",
+          "description": "auto = disable TCMalloc per-CPU caches on Linux 6.19.0-7.0.13, where mongod 8.0.34 refuses to start (SERVER-121912); on/off.",
+          "required": false
+        },
+        "MONGO_FTDC_ENABLED": {
+          "defaultValue": "false",
+          "description": "Full-time diagnostic data capture into the volume (false, as in Railway's MongoDB). true when MongoDB support asks for it.",
+          "required": false
+        },
+        "MONGOD_EXTRA_ARGS": {
+          "defaultValue": "",
+          "description": "Extra mongod flags, space-separated (e.g. --setParameter notablescan=1). Do not repeat flags the wrapper sets.",
+          "required": false
+        },
+        "RAILWAY_DEPLOYMENT_DRAINING_SECONDS": {
+          "defaultValue": "60",
+          "description": "Seconds between SIGTERM and SIGKILL on redeploy, so mongod checkpoints and shuts down cleanly.",
+          "required": false
+        }
+      }
+    },
+    "MongoDB Backup": {
+      "icon": "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/rclone.svg",
+      "source": {
+        "repo": "baranberkay96/mongodb-railway",
+        "rootDirectory": "/services/backup"
+      },
+      "startCommand": null,
+      "preDeployCommand": null,
+      "healthcheckPath": null,
+      "healthcheckTimeout": null,
+      "restartPolicyType": "NEVER",
+      "numReplicas": 1,
+      "cronSchedule": "15 3 * * *",
+      "publicDomain": false,
+      "targetPort": null,
+      "tcpProxy": null,
+      "volume": null,
+      "variables": {
+        "MONGO_URL": {
+          "defaultValue": "${{MongoDB.MONGO_URL}}",
+          "description": "Private replica-set URL of the database (root user; needed for --oplog and full dumps).",
+          "required": true
+        },
+        "BACKUP_S3_BUCKET": {
+          "defaultValue": "${{Bucket.BUCKET}}",
+          "description": "Railway Bucket that stores the backups.",
+          "required": true
+        },
+        "BACKUP_S3_ENDPOINT": {
+          "defaultValue": "${{Bucket.ENDPOINT}}",
+          "description": "Bucket S3 endpoint.",
+          "required": true
+        },
+        "BACKUP_S3_REGION": {
+          "defaultValue": "${{Bucket.REGION}}",
+          "description": "Bucket region.",
+          "required": true
+        },
+        "BACKUP_S3_ACCESS_KEY_ID": {
+          "defaultValue": "${{Bucket.ACCESS_KEY_ID}}",
+          "description": "Bucket access key.",
+          "required": true
+        },
+        "BACKUP_S3_SECRET_ACCESS_KEY": {
+          "defaultValue": "${{Bucket.SECRET_ACCESS_KEY}}",
+          "description": "Bucket secret key.",
+          "required": true
+        },
+        "BACKUP_S3_FORCE_PATH_STYLE": {
+          "defaultValue": "false",
+          "description": "Keep false: Railway Buckets use virtual-hosted-style URLs. true only for buckets whose Credentials tab says path-style.",
+          "required": false
+        },
+        "BACKUP_PREFIX": {
+          "defaultValue": "mongodb",
+          "description": "Folder in the bucket; each run writes {prefix}/{UTC timestamp}/mongodb.archive.gz and MANIFEST.txt.",
+          "required": false
+        },
+        "BACKUP_RETENTION_DAYS": {
+          "defaultValue": "14",
+          "description": "Delete complete runs older than this many days.",
+          "required": false
+        },
+        "BACKUP_KEEP_MIN": {
+          "defaultValue": "3",
+          "description": "Always keep at least this many complete runs, whatever their age.",
+          "required": false
+        },
+        "BACKUP_OPLOG": {
+          "defaultValue": "true",
+          "description": "true = mongodump --oplog (point-in-time consistent dump). false if --db/--query filters are added below.",
+          "required": false
+        },
+        "BACKUP_VERIFY": {
+          "defaultValue": "full",
+          "description": "full = re-read the whole archive (gzip check) and its header; quick = header only (mongorestore --dryRun).",
+          "required": false
+        },
+        "BACKUP_ATTEMPTS": {
+          "defaultValue": "2",
+          "description": "mongodump attempts per run (--oplog fails if a collection is renamed during the dump).",
+          "required": false
+        },
+        "BACKUP_WAIT_SECONDS": {
+          "defaultValue": "300",
+          "description": "How long a run waits for a writable primary before failing.",
+          "required": false
+        },
+        "BACKUP_MONGODUMP_EXTRA_ARGS": {
+          "defaultValue": "",
+          "description": "Extra mongodump flags, space-separated (e.g. --nsExclude=analytics.events).",
+          "required": false
+        },
+        "BACKUP_RESTORE_RUN": {
+          "defaultValue": "",
+          "description": "One-shot restore: a run folder (e.g. 20261031T031500Z) restored into MONGO_URL on the next run. Clear it afterwards.",
+          "required": false
+        },
+        "BACKUP_RESTORE_USERS": {
+          "defaultValue": "false",
+          "description": "true = a restore also replaces users and roles (the root password then becomes the archived one).",
+          "required": false
+        }
+      }
+    }
+  },
+  "buckets": [
+    "Bucket"
+  ]
+}
