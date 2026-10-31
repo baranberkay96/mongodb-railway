@@ -6,7 +6,8 @@
 FROM mongo:8.0.34-noble@sha256:3c64937121b9437095921c4bb2569911084c05f7b88e4a263d62a8959d2b2399
 
 COPY --chmod=0755 mongodb-railway-start mongodb-rs-init /usr/local/bin/
-COPY --chmod=0644 rs-step.js /usr/local/lib/mongodb-railway/rs-step.js
+# 0755, not 0644: BuildKit gives the directory it creates the same mode (unreadable for non-root users).
+COPY --chmod=0755 rs-step.js /usr/local/lib/mongodb-railway/rs-step.js
 COPY --chmod=0644 mongosh.conf /etc/mongosh.conf
 
 # Fail the build early if the image layout this template relies on ever changes.

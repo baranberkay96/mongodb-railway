@@ -10,7 +10,8 @@ FROM mongo:8.0.34-noble@sha256:3c64937121b9437095921c4bb2569911084c05f7b88e4a263
 # rclone's release binary is static (CGO_ENABLED=0 in rclone's Dockerfile), so it runs on Ubuntu.
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 COPY --chmod=0755 mongodb-backup /usr/local/bin/mongodb-backup
-COPY --chmod=0644 primary.js /usr/local/lib/mongodb-backup/primary.js
+# 0755, not 0644: BuildKit gives the directory it creates the same mode (unreadable for non-root users).
+COPY --chmod=0755 primary.js /usr/local/lib/mongodb-backup/primary.js
 COPY --chmod=0644 mongosh.conf /etc/mongosh.conf
 
 ENV HOME=/tmp
