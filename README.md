@@ -1,5 +1,7 @@
 # Deploy and Host MongoDB with Railway
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/mongodb-8-replica-set-prisma-ready-with-?referralCode=20H68q)
+
 MongoDB 8.0 Community Server as a single-node replica set, ready for Prisma, multi-document transactions and change streams. Root user, keyFile and replica set are set up automatically on the first boot, and a daily job stores consistent dumps in a Railway Bucket with retention. Community template, not affiliated with MongoDB, Inc.
 
 ## About Hosting MongoDB
