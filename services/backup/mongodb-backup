@@ -216,8 +216,9 @@ restore_run() {
   local run="$1" dir manifest_oplog args
   [[ "${run}" =~ ${RUN_RE} ]] || die "restore needs a run folder name such as 20261031T031500Z (got '${run}')"
   dir="${REMOTE}/${run}"
-  rclone cat "${dir}/MANIFEST.txt" > "${WORK}/manifest" 2>/dev/null \
-    || die "run ${run} has no MANIFEST.txt (missing or incomplete); see 'mongodb-backup list'"
+  # rclone cat exits 0 with no output for a missing object on bucket remotes, so check the content.
+  rclone cat "${dir}/MANIFEST.txt" > "${WORK}/manifest" 2>/dev/null || true
+  [ -s "${WORK}/manifest" ] || die "run ${run} has no MANIFEST.txt (missing or incomplete); see 'mongodb-backup list'"
   manifest_oplog="$(sed -n 's/^oplog=//p' "${WORK}/manifest")"
   args=(--config="${WORK}/tools.yaml" --archive --gzip --drop --stopOnError)
   [ "${manifest_oplog}" = true ] && args+=(--oplogReplay)
@@ -233,7 +234,8 @@ restore_run() {
 # BACKUP_RESTORE_RUN: restore once, then behave like a normal backup job.
 maybe_restore() {
   [ -n "${RESTORE_RUN}" ] || return 0
-  if rclone cat "${REMOTE}/${RESTORE_RUN}/RESTORED.txt" > /dev/null 2>&1; then
+  # Check the content: rclone cat also exits 0 when RESTORED.txt does not exist.
+  if { rclone cat "${REMOTE}/${RESTORE_RUN}/RESTORED.txt" 2>/dev/null || true; } | grep -q '^restored_at='; then
     log "WARNING: run ${RESTORE_RUN} was already restored; clear BACKUP_RESTORE_RUN. Taking a normal backup."
     return 0
   fi
