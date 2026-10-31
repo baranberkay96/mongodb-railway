@@ -5,17 +5,18 @@
 const base = process.env.MONGO_URL || '';
 const uri = base + (base.includes('?') ? '&' : '?') + 'serverSelectionTimeoutMS=10000&connectTimeoutMS=10000';
 
-function probe() {
+// Explicit async/await: mongosh's implicit awaiting can let a rejected command escape a plain try/catch.
+async function probe() {
   try {
-    const db = connect(uri).getSiblingDB('admin');
-    const hello = db.runCommand({ hello: 1 });
+    const db = (await connect(uri)).getSiblingDB('admin');
+    const hello = await db.runCommand({ hello: 1 });
     if (!hello.isWritablePrimary) {
       return { code: 2, text: 'not ready: no writable primary (setName=' + (hello.setName || 'none') + ')' };
     }
     if (!hello.setName) {
       return { code: 2, text: 'not ready: the server is not a replica set member (mongodump --oplog needs one)' };
     }
-    const info = db.runCommand({ buildInfo: 1 });
+    const info = await db.runCommand({ buildInfo: 1 });
     return { code: 0, text: hello.setName + ' ' + hello.primary + ' ' + info.version };
   } catch (e) {
     const message = String((e && e.message) || e).replace(/mongodb(\+srv)?:\/\/[^@\s]*@/g, 'mongodb://***@');
@@ -24,6 +25,7 @@ function probe() {
 }
 
 // quit() stays outside the try block, so it can never be caught as an error.
-const result = probe();
-print(result.text);
-quit(result.code);
+probe().then((result) => {
+  print(result.text);
+  quit(result.code);
+});
